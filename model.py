@@ -191,11 +191,17 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        new_kv_caches = []
+        # Only collect present_kv tuples when a cache was passed in (i.e. inference).
+        # During training kv_cache is always None, so skipping collection here means
+        # the (k, v) tensors produced inside each block are never kept alive beyond
+        # their natural lifetime in the autograd graph, avoiding unnecessary memory
+        # pressure across all layers for every training step.
+        new_kv_caches = [] if kv_cache is not None else None
         for i, block in enumerate(self.transformer.h):
             layer_cache = kv_cache[i] if kv_cache is not None else None
             x, present_kv = block(x, layer_cache)
-            new_kv_caches.append(present_kv)
+            if new_kv_caches is not None:
+                new_kv_caches.append(present_kv)
 
         x = self.transformer.ln_f(x)
 
