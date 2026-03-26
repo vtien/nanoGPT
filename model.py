@@ -86,6 +86,121 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y, present_kv
 
+class CausalFlashSelfAttention(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
+
+    def forward(self, x, kv_cache=None):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        Q_TILE_SIZE = 128
+        K_TILE_SIZE = 128        
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        N_Q_tiles = math.ceil(q.size(-1) / Q_TILE_SIZE)
+        N_K_tiles = math.ceil(k.size(-1) / K_TILE_SIZE)
+
+        # initialize final output tensors
+        O_final = torch.zeros_like(q, dtype=q.dtype)
+        L_final = torch.zeros((B, self.n_head, T), device=q.device, dtype=torch.float32)
+
+        scale = 1.0 / math.sqrt(k.size(-1))
+
+        # Iterate over batch and head
+        for b in range(B):
+            for h in range(self.n_head):
+                Q_bh = q[b, h, :, :]
+                K_bh = k[b, h, :, :]
+                V_bh = v[b, h, :, :]
+
+                # loop over query tiles
+                for i in range(N_Q_tiles):
+                    q_start = i * Q_TILE_SIZE
+                    q_end = min((i + 1) * Q_TILE_SIZE, T)
+                    Q_tile = Q_bh[q_start:q_end, :]
+
+                    # initialize accumulators for this query tile
+                    o_i = torch.zeros_like(Q_tile, dtype=q.dtype)
+                    l_i = torch.zeros(q_end - q_start, device=q.device, dtype=torch.float32)  # we need a logsum for each block's calculation
+                    m_i = torch.full((q_end - q_start,), -float('inf'), device=q.device, dtype=torch.float32)
+
+                    # inner loop over key/value tiles
+                    for j in range(N_K_tiles):
+                        k_start = j * K_TILE_SIZE
+                        k_end = min((j + 1) * K_TILE_SIZE, T)  # TODO: SHOULD THIS REALLY BE T? Why does tutorial use N_Q and N_K taken from (-2) position of Q and K tensors
+
+                        K_tile = K_bh[k_start:k_end, :]
+                        V_tile = V_bh[k_start:k_end, :]
+
+                        S_ij = (Q_tile @ K_tile.transpose(-1, -2)) * scale
+
+                        # adding for causal attention
+                        q_range = torch.arange(q_start, q_end).reshape(-1, 1)
+                        k_range = torch.arange(k_start, k_end)
+                        S_ij = torch.where(k_range <= q_range, S_ij, -math.inf)
+
+                        # compute the new running maximum
+                        m_local = S_ij.max(dim=-1)[0]  # returns a tuple of values and indices, for max values in each column for every row
+                        m_new = torch.where(m_local > m_i, m_local, m_i)
+
+                        # rescale the previous accumulators (o_i, l__i)
+                        scale_factor = torch.exp(m_i - m_new)  # this accounts for the situation where we found a new m_new. If we haven't, then scale_factor = exp(0) = 1
+                        prev_l_scaled = l_i * scale_factor
+                        prev_o_scaled = o_i * scale_factor.reshape(-1, 1)
+
+                        # compute the probabilities for the current tile, P_tilde_ij = exp(S_ij - m_new)
+                        P_tilde_ij = torch.exp(S_ij - m_new.reshape(-1, 1)) # These are the safe exponentials for the current block: exp(scores - m_new). The reshape broadcasts the per-query max across all keys in the tile.
+
+                        # accumulate the current tile's contribution to the accumulators to update l_i and o_i
+                        l_local = P_tilde_ij.sum(1)
+                        l_i = prev_l_scaled + l_local
+                        o_local = P_tilde_ij.to(torch.bfloat16) @ V_tile.to(torch.bfloat16)
+
+                        o_i = prev_o_scaled + o_local
+
+                        # update the running max for the next iteration
+                        m_i = m_new
+
+
+                    # after iterating through all key tiles, normalize the output
+                    l_i_reciprocal = torch.where(l_i > 0, 1.0 / l_i, 0.0)
+                    o_i_normalized = o_i * l_i_reciprocal.unsqueeze(-1)
+
+                    L_tile = m_i + torch.log(l_i)  # undo the shifted denominator calculation that we do in the online accumulator, shift around terms, and use log for expsum for numerical stability
+                    
+                    # write results for this tile back to the final output tensors
+                    O_final[b, h, q_start:q_end, :] = o_i_normalized
+                    L_final[b, h, q_start:q_end] = L_tile  # useful for the backward pass to recompute P for any tile on the fly using P_ij = exp(S_ij - L_i), where L_i = log(sum_k exp(S_ik)
+
+        O_final = O_final.to(q.dtype)
+
+        return O_final, L_final
+
+
 class MLP(nn.Module):
 
     def __init__(self, config):
