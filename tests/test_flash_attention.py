@@ -1,8 +1,4 @@
 """Output of flash attention should be the same as the regular attention"""
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import torch
 import pytest
 from model import CausalSelfAttention, CausalFlashSelfAttention, GPTConfig
